@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"strings"
@@ -642,6 +643,190 @@ func printFunc(futureSource chan string) chan []string {
 	return promise
 }
 
+func DoWorkVer1(done <-chan interface{}, pulseInterval time.Duration) (<-chan interface{}, <-chan time.Time) {
+	heartbeat := make(chan interface{})
+	results := make(chan time.Time)
+
+	go func() {
+		defer close(heartbeat)
+		defer close(results)
+
+		heartbeatPulse := time.Tick(pulseInterval)
+		workGen := time.Tick(2 * pulseInterval)
+
+		sendHeartBeatPulse := func() {
+			select {
+			case heartbeat <- struct{}{}:
+			default:
+			}
+		}
+		sendResult := func(result time.Time) {
+			for {
+				select {
+				case <-done:
+					return
+				case <-heartbeatPulse:
+					sendHeartBeatPulse()
+				case results <- result.Local():
+				}
+			}
+		}
+
+		for {
+			//for i := 0; i < 2; i++ {
+			select {
+			case <-done:
+				return
+			case <-heartbeatPulse:
+				sendHeartBeatPulse()
+
+			case result := <-workGen:
+				sendResult(result)
+			}
+		}
+	}()
+	return heartbeat, results
+}
+
+func DoWorkVer2(done <-chan interface{}) (<-chan interface{}, <-chan int) {
+	heartbeatStream := make(chan interface{}, 1)
+	workStream := make(chan int)
+	go func() {
+		defer close(heartbeatStream)
+		defer close(workStream)
+
+		for i := 0; i < 10; i++ {
+			select {
+			case heartbeatStream <- struct{}{}:
+			default:
+
+			}
+			select {
+			case <-done:
+				return
+			case workStream <- rand.Intn(10):
+			}
+		}
+	}()
+
+	return heartbeatStream, workStream
+}
+
+type startGoroutinFn func(done <-chan interface{}, pulseInterval time.Duration) (heatbeat <-chan interface{})
+
+func DoWorkFn(done <-chan interface{}, intList ...int) (startGoroutinFn, <-chan interface{}) {
+	intStream := make(chan interface{})
+
+	doWork := func(done <-chan interface{}, pulseInterval time.Duration) <-chan interface{} {
+		heartbeat := make(chan interface{})
+
+		go func() {
+			pulse := time.Tick(pulseInterval)
+		valueLoop:
+			for _, i := range intList {
+				if i < 0 {
+					log.Printf("negative value: %v\n", i)
+				}
+				for {
+					select {
+					case <-pulse:
+						select {
+						case heartbeat <- struct{}{}:
+						default:
+
+						}
+					case intStream <- i:
+						continue valueLoop
+					case <-done:
+						return
+					}
+				}
+			}
+		}()
+		return heartbeat
+	}
+	return doWork, intStream
+}
+
+func newSteward(timeout time.Duration, startGroutine startGoroutinFn) startGoroutinFn {
+	return func(done <-chan interface{}, pulseInterval time.Duration) <-chan interface{} {
+		heartbeat := make(chan interface{})
+
+		go func() {
+			defer close(heartbeat)
+
+			var wardOone chan interface{}
+			var wardHeartbeat <-chan interface{}
+
+			startWard := func() {
+				wardOone = make(chan interface{})
+				wardHeartbeat = startGroutine(wardOone, timeout/2)
+
+			}
+			startWard()
+			pulse := time.Tick(pulseInterval)
+
+		monitorLoop:
+			for {
+				timeoutSignal := time.After(timeout)
+
+				for {
+					select {
+					case <-pulse:
+						select {
+						case heartbeat <- struct{}{}:
+						default:
+						}
+					case <-wardHeartbeat:
+						continue monitorLoop
+					case <-timeoutSignal:
+						log.Println("steward: ward is dead;restaring")
+						close(wardOone)
+						startWard()
+					case <-done:
+						return
+					}
+				}
+			}
+		}()
+
+		return heartbeat
+	}
+}
+
+func orHeartbeat(channels ...chan interface{}) <-chan interface{} {
+	switch len(channels) {
+	case 0:
+		return nil
+	case 1:
+		return channels[0]
+	}
+	orDone := make(chan interface{})
+
+	go func() {
+
+		defer close(orDone)
+
+		switch len(channels) {
+		case 2:
+			select {
+			case <-channels[0]:
+			case <-channels[1]:
+			}
+		default:
+			select {
+			case <-channels[0]:
+			case <-channels[1]:
+			case <-channels[2]:
+				//case <-or(append(channels[3:], orDone)...):
+			}
+		}
+	}()
+
+	return orDone
+
+}
+
 func main() {
 
 	//192 拘束 codebase rule
@@ -941,9 +1126,72 @@ func main() {
 	*/
 
 	//213 future-promise
-	futureSource := readGoFile("main.go")
-	futureFunc := printFunc(futureSource)
+	/*
+		futureSource := readGoFile("main.go")
+		futureFunc := printFunc(futureSource)
+		fmt.Println(strings.Join(<-futureFunc, "\n"))
+	*/
 
-	fmt.Println(strings.Join(<-futureFunc, "\n"))
+	//214 heartbeat時間で鼓動を送る
+	/*
+		done := make(chan interface{})
+		const timeout = 2 * time.Second
+
+		heartbeat, results := DoWorkVer1(done, timeout/2)
+
+		for {
+			select {
+			case _, ok := <-heartbeat:
+				if !ok {
+					return
+				}
+				fmt.Println("receive heartbeat")
+			case r, ok := <-results:
+				if !ok {
+					return
+				}
+				fmt.Printf("result: %v\n", r)
+			case <-time.After(timeout):
+				fmt.Println("worker gorouttine id dead")
+				return
+			}
+		}
+	*/
+
+	//215 heartbeat 仕事ごとに送る
+	/*
+		done := make(chan interface{})
+		defer close(done)
+
+		heartbeat, results := DoWorkVer2(done)
+		for {
+			select {
+			case _, ok := <-heartbeat:
+				if ok {
+					fmt.Println("Pulse")
+				} else {
+					return
+				}
+			case r, ok := <-results:
+				if ok {
+					fmt.Printf("result: %v\n", r)
+				} else {
+					return
+				}
+			}
+		}
+	*/
+
+	//216 heartbeatを使って再起動するサンプル
+	done := make(chan interface{})
+	defer close(done)
+
+	dowork, intStream := DoWorkFn(done, 1, 2, -1, 3, 4, 5)
+	dowarkWithSteward := newSteward(1*time.Second, dowork)
+	dowarkWithSteward(done, 1*time.Second)
+
+	for i := range intStream {
+		fmt.Printf("Receieve: %v\n", i)
+	}
 
 }
